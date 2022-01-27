@@ -1,23 +1,40 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
+
+#include <sys/signalfd.h>
 
 #include <libinput.h>
 
 #include <libudev.h>
 
+#include "gesture.h"
+
 enum {
 	LIBINPUT_FD,
+	SIGNAL_FD,
 	NB_FDS
 };
 
 struct context {
+	/* process lifecycle */
+	int sigfd;
+	bool stop;
+
+	/* libudev context */
 	struct udev *udev;
+
+	/* libinput context */
 	struct libinput *li;
+
+	/* hold current gesture pointer */
+	struct gesture *gesture;
 };
 
 const char * const event_to_str[] = {
@@ -31,7 +48,8 @@ const char * const event_to_str[] = {
 	[LIBINPUT_EVENT_POINTER_AXIS] = "POINTER_AXIS",
 	[LIBINPUT_EVENT_POINTER_SCROLL_WHEEL] = "POINTER_SCROLL_WHEEL",
 	[LIBINPUT_EVENT_POINTER_SCROLL_FINGER] = "POINTER_SCROLL_FINGER",
-	[LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS] = "POINTER_SCROLL_CONTINUOUS",
+	[LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS] =
+		"POINTER_SCROLL_CONTINUOUS",
 	[LIBINPUT_EVENT_TOUCH_DOWN] = "TOUCH_DOWN",
 	[LIBINPUT_EVENT_TOUCH_UP] = "TOUCH_UP",
 	[LIBINPUT_EVENT_TOUCH_MOTION] = "TOUCH_MOTION",
@@ -77,6 +95,9 @@ static void context_destroy(struct context *ctx)
 	if (!ctx)
 		return;
 
+	if (ctx->gesture)
+		gesture_destroy(ctx->gesture);
+
 	libinput_unref(ctx->li);
 	udev_unref(ctx->udev);
 
@@ -86,6 +107,8 @@ static void context_destroy(struct context *ctx)
 static struct context *context_new(void)
 {
 	struct context *ctx = NULL;
+	sigset_t mask;
+	int ret;
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx)
@@ -103,8 +126,28 @@ static struct context *context_new(void)
 		goto exit;
 	}
 
-	libinput_udev_assign_seat(ctx->li, "seat0");
-	/* libinput_log_set_priority(ctx->li, LIBINPUT_LOG_PRIORITY_INFO); */
+	ret = libinput_udev_assign_seat(ctx->li, "seat0");
+	if (ret < 0) {
+		fprintf(stderr, "Failed to assign udev seat: %s\n",
+			strerror(-ret));
+		goto exit;
+	}
+
+	/* handle signals for clean termination */
+	sigemptyset(&mask);
+	sigaddset(&mask, SIGINT);
+	sigaddset(&mask, SIGQUIT);
+	sigaddset(&mask, SIGTERM);
+	ret = sigprocmask(SIG_BLOCK, &mask, NULL);
+	if (ret < 0) {
+		fprintf(stderr, "Failed to set sigprocmask: %s\n",
+			strerror(-ret));
+		goto exit;
+	}
+
+	ctx->sigfd = signalfd(-1, &mask, 0);
+	if (ctx->sigfd < 0)
+		goto exit;
 
 	return ctx;
 exit:
@@ -112,7 +155,6 @@ exit:
 	return NULL;
 }
 
-#if 0
 static bool event_is_gesture(struct libinput_event *event)
 {
 	enum libinput_event_type type = libinput_event_get_type(event);
@@ -130,68 +172,72 @@ static bool event_is_gesture(struct libinput_event *event)
 		return false;
 	};
 }
-#endif
 
-static bool event_is_swipe(struct libinput_event *event)
-{
-	enum libinput_event_type type = libinput_event_get_type(event);
-	switch (type) {
-	case LIBINPUT_EVENT_GESTURE_SWIPE_END:
-	case LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN:
-	case LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE:
-		return true;
-	default:
-		return false;
-	};
-}
-
-static int process_gesture(struct libinput_event_gesture *gesture)
+static int event_process_gesture(struct libinput *li,
+				 struct libinput_event *event)
 {
 	int ret = 0;
+	struct context *ctx = libinput_get_user_data(li);
 	enum libinput_event_type type;
-	int nfingers;
-	bool canceled;
-	double dx, dy;
 
-	type = libinput_event_get_type(libinput_event_gesture_get_base_event(gesture));
-	nfingers = libinput_event_gesture_get_finger_count(gesture);
-	canceled = !!libinput_event_gesture_get_cancelled(gesture);
-	dx = libinput_event_gesture_get_dx(gesture);
-	dy = libinput_event_gesture_get_dy(gesture);
+	type = libinput_event_get_type(event);
+	/* nfingers = libinput_event_gesture_get_finger_count(gesture); */
+	/* canceled = !!libinput_event_gesture_get_cancelled(gesture); */
 
-	fprintf(stdout, " >>> %s: type '%s'\n", __func__, event_to_str[type]);
-	fprintf(stdout, " >>> %s: fingers %d\n", __func__, nfingers);
-	fprintf(stdout, " >>> %s: canceled %d\n", __func__, canceled);
-	fprintf(stdout, " >>> %s: dx %f dy %f\n", __func__, dx, dy);
+	switch (type) {
+	case LIBINPUT_EVENT_GESTURE_HOLD_BEGIN:
+	case LIBINPUT_EVENT_GESTURE_PINCH_BEGIN:
+	case LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN:
+		if (ctx->gesture) {
+			fprintf(stderr, "Cancelling ongoing gesture\n");
+			gesture_destroy(ctx->gesture);
+		}
+		ctx->gesture = gesture_new(
+				libinput_event_get_gesture_event(event));
+		if (!ctx->gesture) {
+			ret = -ENOMEM;
+			goto exit;
+		}
+		break;
 
+	case LIBINPUT_EVENT_GESTURE_HOLD_END:
+	case LIBINPUT_EVENT_GESTURE_PINCH_END:
+	case LIBINPUT_EVENT_GESTURE_SWIPE_END:
+		if (!ctx->gesture)
+			fprintf(stderr, "Missing ongoing gesture to end\n");
+		gesture_destroy(ctx->gesture);
+		ctx->gesture = NULL;
+		break;
+
+	default:
+		break;
+	};
+
+exit:
 	return ret;
 }
 
-static int process_events(struct libinput *li)
+static int event_process(struct libinput *li)
 {
 	int ret = 0;
 	struct libinput_event *event = NULL;
-	struct libinput_event_gesture *gesture = NULL;
 
 	do {
 		event = libinput_get_event(li);
 		if (!event)
 			break;
 
-		if (!event_is_swipe(event))
+		if (!event_is_gesture(event))
 			continue;
 
-		gesture = libinput_event_get_gesture_event(event);
-		if (!gesture)
-			continue;
-
-		ret = process_gesture(gesture);
+		ret = event_process_gesture(li, event);
 		if (ret < 0) {
 			libinput_event_destroy(event);
 			goto exit;
 		}
 
 		libinput_event_destroy(event);
+		/* loop to make sure we don't miss spurious event */
 	} while (event);
 exit:
 	return ret;
@@ -212,6 +258,9 @@ int main(void)
 	fds[LIBINPUT_FD].fd = libinput_get_fd(ctx->li);
 	fds[LIBINPUT_FD].events = POLLIN;
 
+	fds[SIGNAL_FD].fd = ctx->sigfd;
+	fds[SIGNAL_FD].events = POLLIN;
+
 	do {
 		do {
 			ret = poll(fds, NB_FDS, -1);
@@ -219,10 +268,16 @@ int main(void)
 
 		if (fds[LIBINPUT_FD].revents) {
 			libinput_dispatch(ctx->li);
-			process_events(ctx->li);
+			event_process(ctx->li);
 		}
 
-	} while (1);
+		/* signals */
+		if (fds[SIGNAL_FD].revents) {
+			fprintf(stdout, "Signal received, bailing out...\n");
+			ctx->stop = 1;
+		}
+
+	} while (!ctx->stop);
 
 exit:
 	context_destroy(ctx);
