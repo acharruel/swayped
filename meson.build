@@ -1,12 +1,17 @@
 project('swayped', 'c')
 
+cc = meson.get_compiler('c')
+
 # sources
 src = [
+    'src/command.c',
     'src/gesture.c',
-    'src/main.c'
+    'src/main.c',
+    'src/swipe.c'
     ]
 
 deps = [
+    cc.find_library('m'),
     dependency('inih'),
     dependency('libinput'),
     dependency('libudev')
@@ -14,4 +19,5 @@ deps = [
 
 executable('swayped',
     src,
-    dependencies: deps)
+    dependencies: deps,
+    install: true)

@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 #include <unistd.h>
 
 #include <sys/signalfd.h>
@@ -96,7 +97,7 @@ static void context_destroy(struct context *ctx)
 		return;
 
 	if (ctx->gesture)
-		gesture_destroy(ctx->gesture);
+		gesture_destroy(ctx->gesture, NULL);
 
 	libinput_unref(ctx->li);
 	udev_unref(ctx->udev);
@@ -116,19 +117,19 @@ static struct context *context_new(void)
 
 	ctx->udev = udev_new();
 	if (!ctx->udev) {
-		fprintf(stderr, "Failed to create udev context\n");
+		syslog(LOG_ERR, "Failed to create udev context\n");
 		goto exit;
 	}
 
 	ctx->li = libinput_udev_create_context(&interface, ctx, ctx->udev);
 	if (!ctx->li) {
-		fprintf(stderr, "Failed to create libinput context\n");
+		syslog(LOG_ERR, "Failed to create libinput context\n");
 		goto exit;
 	}
 
 	ret = libinput_udev_assign_seat(ctx->li, "seat0");
 	if (ret < 0) {
-		fprintf(stderr, "Failed to assign udev seat: %s\n",
+		syslog(LOG_ERR, "Failed to assign udev seat: %s\n",
 			strerror(-ret));
 		goto exit;
 	}
@@ -140,7 +141,7 @@ static struct context *context_new(void)
 	sigaddset(&mask, SIGTERM);
 	ret = sigprocmask(SIG_BLOCK, &mask, NULL);
 	if (ret < 0) {
-		fprintf(stderr, "Failed to set sigprocmask: %s\n",
+		syslog(LOG_ERR, "Failed to set sigprocmask: %s\n",
 			strerror(-ret));
 		goto exit;
 	}
@@ -189,8 +190,9 @@ static int event_process_gesture(struct libinput *li,
 	case LIBINPUT_EVENT_GESTURE_PINCH_BEGIN:
 	case LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN:
 		if (ctx->gesture) {
-			fprintf(stderr, "Cancelling ongoing gesture\n");
-			gesture_destroy(ctx->gesture);
+			syslog(LOG_ERR, "Cancelling ongoing gesture\n");
+			gesture_destroy(ctx->gesture,
+				libinput_event_get_gesture_event(event));
 		}
 		ctx->gesture = gesture_new(
 				libinput_event_get_gesture_event(event));
@@ -200,12 +202,21 @@ static int event_process_gesture(struct libinput *li,
 		}
 		break;
 
+	case LIBINPUT_EVENT_GESTURE_PINCH_UPDATE:
+	case LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE:
+		if (!ctx->gesture)
+			syslog(LOG_ERR, "Missing ongoing gesture to update\n");
+		gesture_update(ctx->gesture,
+			       libinput_event_get_gesture_event(event));
+		break;
+
 	case LIBINPUT_EVENT_GESTURE_HOLD_END:
 	case LIBINPUT_EVENT_GESTURE_PINCH_END:
 	case LIBINPUT_EVENT_GESTURE_SWIPE_END:
 		if (!ctx->gesture)
-			fprintf(stderr, "Missing ongoing gesture to end\n");
-		gesture_destroy(ctx->gesture);
+			syslog(LOG_ERR, "Missing ongoing gesture to end\n");
+		gesture_destroy(ctx->gesture,
+				libinput_event_get_gesture_event(event));
 		ctx->gesture = NULL;
 		break;
 
@@ -273,7 +284,7 @@ int main(void)
 
 		/* signals */
 		if (fds[SIGNAL_FD].revents) {
-			fprintf(stdout, "Signal received, bailing out...\n");
+			syslog(LOG_ERR, "Signal received, bailing out...\n");
 			ctx->stop = 1;
 		}
 
