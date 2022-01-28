@@ -6,6 +6,8 @@ cc = meson.get_compiler('c')
 src = [
     'src/command.c',
     'src/gesture.c',
+    'src/sway/ipc-client.c',
+    'src/sway/log.c',
     'src/main.c',
     'src/swipe.c'
     ]
