@@ -28,6 +28,8 @@ static void swipe_detected(struct swipe *sw, enum swipe_direction direction)
 	switch (direction) {
 	case SWIPE_UP:
 		syslog(LOG_INFO, "%s: UP fingers %d\n", __func__, sw->nfingers);
+		if (sw->nfingers == 3)
+			command_workspace_new();
 		break;
 	case SWIPE_DOWN:
 		syslog(LOG_INFO, "%s: DOWN finger %d\n", __func__, sw->nfingers);

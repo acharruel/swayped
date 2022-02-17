@@ -15,6 +15,7 @@ src = [
 deps = [
     cc.find_library('m'),
     dependency('inih'),
+    dependency('json-c'),
     dependency('libinput'),
     dependency('libudev')
     ]
